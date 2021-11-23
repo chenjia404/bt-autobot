@@ -554,4 +554,190 @@ class MintService
             }
         }
     }
+
+
+    /**
+     * 归集qbt里面的qki
+     */
+    public function qbt_qki($group_id,$amount = 500)
+    {
+        $group = AddressGroup::find($group_id);
+        $chainid = "20181205";
+        $net_type = 'qki';
+        $contract_address = '0xdBA7683d7F14cC9C18AE1777A518e49885B55889';
+        $anti_bot_a = '5000000000000000000';
+        $gasPrice = '150000000000';
+        $min_gas = bcmul('1000000000000000000','0.1',0);
+
+
+        $real_last_block = (new RpcService())->rpc('eth_getBlockByNumber', [['latest', true]],$net_type);
+        $block_time = base_convert($real_last_block[0]['result']['timestamp'],16,10);
+        if(time() - $block_time > 20 )
+        {
+            echo "区块没有同步\n";
+            sleep(20);
+            return;
+        }
+
+        $qki_credential = \EthTool\Credential::fromKey($group->private_key);
+
+        $qki_amount = $this->qk_node->QKI()->getBalance($qki_credential->getAddress());
+        echo $qki_credential->getAddress() . " 矿工费:{$qki_amount}QKI\n";
+
+
+        $rpc = new RpcService();
+        $qki_address_nonce = $rpc->getTransactionCount($qki_credential->getAddress(),$net_type);
+        if($qki_address_nonce != $group->address_nonce)
+        {
+            $group->address_nonce = $qki_address_nonce;
+            $group->save();
+            echo "更新nonce\n";
+        }
+
+        $min_nonce = 11;
+        if($group_id > 1)
+            $min_nonce = 0;
+        $addresses = Address::where('group_id',$group_id)
+            ->where('nonce','>=',$min_nonce)
+            ->orderBy('id','asc')
+            ->orderBy('updated_at','asc')
+            ->limit($amount)
+            ->get();
+
+        $abi = file_get_contents('./public/contract/qbt.abi');
+
+        $erc20 = new ERC20($this->qk_node);
+        $erc20->abiPath('./public/contract/qbt.abi');
+        $token = $erc20->token($contract_address);
+
+        foreach ($addresses as $address)
+        {
+            if(time() - $address->last_check_time < 300)
+            {
+                echo "最新更新过\n";
+                continue;
+            }
+            $nonce = $rpc->getTransactionCount($address->address,$net_type);
+            if($nonce != $address->nonce)
+            {
+                $address->nonce = $nonce;
+                $address->save();
+                echo "更新nonce\n";
+            }
+
+
+            $qki_amount = $this->qk_node->QKI()->getBalance($address->address);
+            $gas_qki_amount = $this->qk_node->QKI()->getBalance($qki_credential->getAddress());
+            $coin_balance_of = $token->call("CoinBalanceOf", [$address->address]);
+
+            //需要余额大于1才挖矿
+            if(bccomp($qki_amount,'0.1',8) >= 0)
+            {
+                $address_qki_credential = Credential::fromKey($address->private_key);
+
+                if($coin_balance_of[0] > 100)
+                {
+                    $send_qki = $coin_balance_of[0];
+                    $rtb = RawTxBuilder::create()
+                            ->credential($address_qki_credential)
+                            ->gasLimit('120000')
+                            ->gasPrice($gasPrice)
+                            ->chainId($chainid)
+                            ->nonce((int)$address->nonce)
+                            ->contract($abi)  //创建合约对象
+                            ->at($contract_address)       //设置合约对象的部署地址
+                            ->getSendTx('withdraw',$send_qki);
+
+                    $data = (new RpcService())->rpc('eth_sendRawTransaction', [[$rtb]],$net_type);
+                    sleep(1);
+
+                    if(isset($data[0]['error']))
+                    {
+                        echo "提现qki:";
+                        echo $data[0]['error']['message'] . "\n";
+                        continue;
+                    }
+                    else
+                    {
+                        $address->nonce++;
+                            $address->save();
+                            echo "提现qki:" . $data[0]['result'] . "\n";
+                            continue;
+                    }
+                }
+                //归集qki
+                elseif($coin_balance_of[0] == 0 && $qki_amount > 1)
+                {
+                    $rtb = RawTxBuilder::create()
+                    ->credential($address_qki_credential)
+                    ->gasLimit('200000')
+                    ->gasPrice($gasPrice)
+                    ->chainId($chainid)
+                    ->nonce((int)$address->nonce)
+                    ->to($group->collection_address)                    //设置交易接收账户
+                    ->value('1000000000000000000')              //补充到1.01qki
+                    ->getPlainTx();	             //获取裸交易码流
+
+                    $data = (new RpcService())->rpc('eth_sendRawTransaction', [[$rtb]],$net_type);
+                    sleep(1);
+
+                    if(isset($data[0]['error']))
+                    {
+                        echo "归集qki:";
+                        echo $data[0]['error']['message'] . "\n";
+                        continue;
+                    }
+                    else
+                    {
+                        $address->nonce++;
+                            $address->save();
+                            echo "归集qki:" . $data[0]['result'] . "\n";
+                            continue;
+                    }
+                }
+            }
+            else //补充qki
+            {
+                //计算需要的qki数量
+                $send_qki_amount = bcmul('1000000000000000000',bcsub('0.1',$qki_amount,8),0);
+                //如果需要的矿工费不多，直接补充一个标准
+                if (bccomp($send_qki_amount,$min_gas) < 0)
+                $send_qki_amount = $min_gas;
+
+                echo "挖矿账户{$address->address} qki不足,开始补充 矿工费账户:{$gas_qki_amount}\n";
+                $rtb = RawTxBuilder::create()
+                    ->credential($qki_credential)
+                    ->gasLimit('200000')
+                    ->gasPrice($gasPrice)
+                    ->chainId($chainid)
+                    ->nonce((int)$group->address_nonce)
+                    ->to($address->address)                    //设置交易接收账户
+                    ->value($send_qki_amount)              //补充到1.01qki
+                    ->getPlainTx();	             //获取裸交易码流
+
+                $data = (new RpcService())->rpc('eth_sendRawTransaction', [[$rtb]],$net_type);
+
+                if(isset($data[0]['error']))
+                {
+                    echo $data[0]['error']['message'] . "\n";
+                    //刷新更新时间，避免阻塞
+                    $address->nonce++;
+                    $address->save();
+                    sleep(1);
+                }
+                else
+                {
+
+                    $group->address_nonce++;
+                    $group->save();
+
+                    //刷新更新时间，避免阻塞
+                    $address->nonce++;
+                    $address->save();
+                    sleep(2);
+                    echo $data[0]['result'] . "\n";
+                }
+            }
+        }
+    }
 }

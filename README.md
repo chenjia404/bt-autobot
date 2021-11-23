@@ -30,6 +30,13 @@ php artisan create_address  1 1000
 php artisan mint_qbt  1 1000
 ```
 
+
+
+归集qki,第一组，2000个地址
+```
+php artisan qbt_qki  1 1000
+```
+
 挖矿这个命令建议使用定时任务自动执行
 ## 配置
 
